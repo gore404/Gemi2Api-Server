@@ -27,6 +27,7 @@ from gemini_webapi import GeminiClient, set_log_level
 from gemini_webapi.constants import Model
 from PIL import Image
 from pydantic import BaseModel
+from session_manager import session_manager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -424,6 +425,34 @@ class ChatCompletionRequest(BaseModel):
 	presence_penalty: Optional[float] = 0
 	frequency_penalty: Optional[float] = 0
 	user: Optional[str] = None
+	chat_id: Optional[str] = None
+	save_session: Optional[bool] = True
+
+
+
+class ChatSessionResponse(BaseModel):
+	id: str
+	object: str = "chat.session"
+	created: str
+	updated: str
+	title: str
+	model: Optional[str] = None
+
+
+class ChatSessionList(BaseModel):
+	object: str = "list"
+	data: List[ChatSessionResponse]
+
+
+class ChatHistoryTurn(BaseModel):
+	role: str
+	text: str
+
+
+class ChatHistory(BaseModel):
+	id: str
+	object: str = "chat.history"
+	turns: List[ChatHistoryTurn]
 
 
 class Choice(BaseModel):
@@ -755,11 +784,12 @@ async def create_chat_completion(
 		# 转换消息为对话格式
 		conversation, temp_files = prepare_conversation(request.messages)
 		logger.info(
-			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s",
+			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s chat_id=%s",
 			request.stream,
 			request.model,
 			len(request.messages),
 			len(temp_files),
+			request.chat_id,
 		)
 
 		# 获取适当的模型
@@ -776,6 +806,16 @@ async def create_chat_completion(
 			gen_kwargs["temporary"] = True
 		if temp_files:
 			gen_kwargs["files"] = temp_files
+
+
+		# Handle session continuation
+		if request.chat_id:
+			saved = session_manager.get_session(request.chat_id)
+			if saved and saved.get("metadata"):
+				gen_kwargs["metadata"] = saved["metadata"]
+				logger.info(f"Continuing session {request.chat_id}")
+			else:
+				logger.warning(f"Session {request.chat_id} not found, creating new session")
 
 		if request.stream:
 			# Real streaming using upstream generate_content_stream
@@ -819,7 +859,7 @@ async def create_chat_completion(
 						if hasattr(chunk, "metadata") and chunk.metadata:
 							last_metadata = chunk.metadata
 						# Capture conversation ID for auto-deletion
-						if AUTO_DELETE_CHAT and captured_cid is None and hasattr(chunk, "metadata") and chunk.metadata and len(chunk.metadata) > 0:
+						if AUTO_DELETE_CHAT and not request.chat_id and captured_cid is None and hasattr(chunk, "metadata") and chunk.metadata and len(chunk.metadata) > 0:
 							captured_cid = chunk.metadata[0]
 
 						# Handle thinking/thoughts delta
@@ -896,6 +936,11 @@ async def create_chat_completion(
 					)
 					if last_metadata and len(last_metadata) > 0 and not AUTO_DELETE_CHAT:
 						asyncio.create_task(background_verify_chat_persistence(gemini_client, last_metadata[0], "stream"))
+					# Save session if requested
+					if request.save_session and last_metadata and len(last_metadata) > 0:
+						sid = request.chat_id or last_metadata[0]
+						session_manager.save_session(session_id=sid, metadata=list(last_metadata), model=request.model)
+						logger.info(f"Saved session {sid}")
 				except Exception as e:
 					logger.error(f"Error during streaming: {str(e)}", exc_info=True)
 					# Send error as a content chunk so the client sees it
@@ -905,7 +950,7 @@ async def create_chat_completion(
 					yield "data: [DONE]\n\n"
 				finally:
 					# Create background task to delete the chat if AUTO_DELETE_CHAT is enabled
-					if AUTO_DELETE_CHAT and captured_cid:
+					if AUTO_DELETE_CHAT and not request.chat_id and captured_cid:
 						asyncio.create_task(background_delete_chat(gemini_client, captured_cid))
 
 					# 清理临时文件
@@ -921,7 +966,13 @@ async def create_chat_completion(
 			try:
 				response = await gemini_client.generate_content(conversation, **gen_kwargs)
 
-				if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
+				# Save session if requested
+				if request.save_session and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
+					sid = request.chat_id or response.metadata[0]
+					session_manager.save_session(session_id=sid, metadata=list(response.metadata), model=request.model)
+					logger.info(f"Saved session {sid}")
+
+				if AUTO_DELETE_CHAT and not request.chat_id and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 					cid = response.metadata[0]
 					asyncio.create_task(background_delete_chat(gemini_client, cid))
 				elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
@@ -1101,6 +1152,136 @@ async def root():
 	"""
 	return {"status": "online", "message": "Gemini API FastAPI Server is running"}
 
+
+
+
+# ===== Session Management API Endpoints =====
+
+@app.get("/v1/chats", response_model=ChatSessionList)
+async def list_chats(
+	limit: int = 50,
+	api_key: str = Depends(verify_api_key),
+):
+	"""List all saved chat sessions."""
+	sessions = session_manager.list_sessions(limit=limit)
+	return ChatSessionList(
+		object="list",
+		data=[
+			ChatSessionResponse(
+				id=s["id"],
+				object="chat.session",
+				created=s.get("created_at", ""),
+				updated=s.get("updated_at", ""),
+				title=s.get("title", f"Session {s['id'][:8]}"),
+				model=s.get("model"),
+			)
+			for s in sessions
+		],
+	)
+
+
+@app.get("/v1/chats/{chat_id}")
+async def get_chat(
+	chat_id: str,
+	api_key: str = Depends(verify_api_key),
+):
+	"""Get details of a specific chat session."""
+	session = session_manager.get_session(chat_id)
+	if not session:
+		raise HTTPException(status_code=404, detail=f"Chat session {chat_id} not found")
+	return {
+		"id": session["id"],
+		"object": "chat.session",
+		"created": session.get("created_at", ""),
+		"updated": session.get("updated_at", ""),
+		"title": session.get("title"),
+		"model": session.get("model"),
+		"metadata": session.get("metadata"),
+	}
+
+
+@app.get("/v1/chats/{chat_id}/history")
+async def get_chat_history(
+	chat_id: str,
+	api_key: str = Depends(verify_api_key),
+):
+	"""Get the conversation history of a specific chat session."""
+	global gemini_client
+	gemini_client = await get_gemini_client()
+
+	session = session_manager.get_session(chat_id)
+	if not session:
+		raise HTTPException(status_code=404, detail=f"Chat session {chat_id} not found")
+
+	try:
+		history = await gemini_client.read_chat(chat_id)
+		if not history:
+			return ChatHistory(id=chat_id, object="chat.history", turns=[])
+
+		turns = []
+		for turn in history.turns:
+			turns.append(ChatHistoryTurn(
+				role=getattr(turn, "role", "unknown").lower(),
+				text=getattr(turn, "text", str(turn)),
+			))
+
+		return ChatHistory(id=chat_id, object="chat.history", turns=turns)
+	except Exception as e:
+		logger.error(f"Failed to read chat history: {e}")
+		raise HTTPException(status_code=500, detail=f"Failed to read chat history: {str(e)}")
+
+
+@app.delete("/v1/chats/{chat_id}")
+async def delete_chat(
+	chat_id: str,
+	api_key: str = Depends(verify_api_key),
+):
+	"""Delete a chat session from both Gemini and local storage."""
+	global gemini_client
+	gemini_client = await get_gemini_client()
+
+	session = session_manager.get_session(chat_id)
+	if not session:
+		raise HTTPException(status_code=404, detail=f"Chat session {chat_id} not found")
+
+	# Delete from Gemini
+	try:
+		await gemini_client.delete_chat(chat_id)
+	except Exception as e:
+		logger.warning(f"Failed to delete chat from Gemini: {e}")
+
+	# Delete from local storage
+	session_manager.delete_session(chat_id)
+
+	return {"status": "deleted", "id": chat_id}
+
+
+@app.get("/v1/chats/recent/list")
+async def list_recent_chats(
+	limit: int = 20,
+	api_key: str = Depends(verify_api_key),
+):
+	"""List recent chats from Gemini history."""
+	global gemini_client
+	gemini_client = await get_gemini_client()
+
+	try:
+		chats = await gemini_client.list_chats()
+		if not chats:
+			return {"object": "list", "data": []}
+
+		result = []
+		for i, chat in enumerate(chats[:limit]):
+			result.append({
+				"id": getattr(chat, "cid", str(i)),
+				"object": "chat.session",
+				"title": getattr(chat, "title", f"Chat {i+1}"),
+			})
+
+		return {"object": "list", "data": result}
+	except Exception as e:
+		logger.error(f"Failed to list recent chats: {e}")
+		raise HTTPException(status_code=500, detail=f"Failed to list recent chats: {str(e)}")
 
 if __name__ == "__main__":
 	import uvicorn
