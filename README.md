@@ -91,6 +91,36 @@ docker-compose up -d --build
 - `POST /v1/chat/completions`: 与模型聊天 (类似OpenAI接口)
 - `GET /gemini-proxy/image`: 图片代理接口（有生成图片需求时，需要保证此端点可直接访问，如果使用反向代理则需要填写`PUBLIC_BASE_URL`环境变量）
 
+### 会话管理 API
+
+- `GET /v1/chats`: 列出所有已保存的会话
+- `GET /v1/chats/{chat_id}`: 获取会话详情
+- `GET /v1/chats/{chat_id}/history`: 获取会话历史记录
+- `DELETE /v1/chats/{chat_id}`: 删除会话
+- `GET /v1/chats/recent/list`: 从 Gemini 获取最近的会话列表
+
+### 会话复用
+
+在 `/v1/chat/completions` 请求中添加 `chat_id` 参数即可复用已有会话：
+
+```json
+{
+  "model": "gemini-2.0-flash",
+  "messages": [{"role": "user", "content": "继续之前的对话"}],
+  "chat_id": "existing_session_id",
+  "save_session": true
+}
+```
+
+参数说明：
+- `chat_id`: 可选，已有会话的 ID。不提供则创建新会话
+- `save_session`: 可选，默认 `true`。是否保存会话元数据到本地
+
+### 环境变量
+
+新增环境变量：
+- `SESSION_STORAGE_PATH`: 会话存储路径，默认为 `./sessions`
+
 ## 常见问题
 
 ### 服务器报 500 问题解决方案
